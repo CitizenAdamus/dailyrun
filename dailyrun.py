@@ -9,6 +9,7 @@ import os
 import io
 import pandas as pd
 from datetime import datetime
+from collections import defaultdict
 
 # Default email configuration (can be overridden in sidebar)
 DEFAULT_EMAIL_SERVER = 'smtp.gmail.com'
@@ -70,7 +71,7 @@ if uploaded_pdf is not None and len(RUN_TO_EMAIL) > 0:
                     page = reader.pages[page_num]
                     text_per_page.append(page.extract_text())
             
-            # Identify runs
+            # Identify runs (fixed to handle repeated headers per run)
             runs = {}
             start_pages = []
             for page_num, text in enumerate(text_per_page):
@@ -80,11 +81,13 @@ if uploaded_pdf is not None and len(RUN_TO_EMAIL) > 0:
                     if run_lines:
                         run_line = run_lines[0]
                         run_num = run_line.split('Run: ')[1].split()[0].strip()
-                        # Extract operator name
-                        operator_lines = [line for line in text.split('\n') if 'Operator name:' in line]
-                        operator = operator_lines[0].split(':')[1].strip() if operator_lines else 'Unknown'
-                        runs[run_num] = {'start_page': page_num, 'operator': operator}
-                        start_pages.append((run_num, page_num))
+                        # Only add if not already seen (avoids duplicates from page headers)
+                        if run_num not in runs:
+                            # Extract operator name
+                            operator_lines = [line for line in text.split('\n') if 'Operator name:' in line]
+                            operator = operator_lines[0].split(':')[1].strip() if operator_lines else 'Unknown'
+                            runs[run_num] = {'start_page': page_num, 'operator': operator}
+                            start_pages.append((run_num, page_num))
             
             # Sort start_pages
             start_pages.sort(key=lambda x: x[1])
@@ -97,7 +100,7 @@ if uploaded_pdf is not None and len(RUN_TO_EMAIL) > 0:
                 OUTPUT_DIR = 'split_runs'
                 os.makedirs(OUTPUT_DIR, exist_ok=True)
                 
-                # Split PDF
+                # Split PDF into individual run files
                 split_pdfs = {}
                 with open(PDF_PATH, 'rb') as file:
                     reader = PyPDF2.PdfReader(file)
@@ -119,59 +122,85 @@ if uploaded_pdf is not None and len(RUN_TO_EMAIL) > 0:
                         split_pdfs[run_num] = output_path
                         st.write(f"Split {run_num}: pages {start+1} to {end} ({end - start} pages)")
                 
-                # Send emails
+                # Group runs by email (driver)
+                email_to_runs = defaultdict(list)
+                for run_num, run_pdf in split_pdfs.items():
+                    if run_num in RUN_TO_EMAIL:
+                        email = RUN_TO_EMAIL[run_num]
+                        email_to_runs[email].append((run_num, run_pdf))
+                
+                # Merge PDFs per driver and send emails
                 if sender_email and sender_password:
                     sent_count = 0
                     failed_count = 0
-                    for run_num, pdf_path in split_pdfs.items():
-                        if run_num in RUN_TO_EMAIL:
-                            email = RUN_TO_EMAIL[run_num]
-                            date_str = datetime.now().strftime('%Y/%m/%d')
-                            subject = f"Your Run Sheet for {run_num} - {date_str}"
-                            body = f"Dear Driver,\n\nPlease find attached your run sheet for {run_num}.\n\nBest regards,\nAdmin"
-                            
-                            msg = MIMEMultipart()
-                            msg['From'] = sender_email
-                            msg['To'] = email
-                            msg['Subject'] = subject
-                            
-                            msg.attach(MIMEText(body, 'plain'))
-                            
-                            with open(pdf_path, 'rb') as attachment:
-                                part = MIMEBase('application', 'octet-stream')
-                                part.set_payload(attachment.read())
-                            
-                            encoders.encode_base64(part)
-                            part.add_header(
-                                'Content-Disposition',
-                                f'attachment; filename= {os.path.basename(pdf_path)}'
-                            )
-                            msg.attach(part)
-                            
-                            try:
-                                server = smtplib.SMTP(email_server, email_port)
-                                server.starttls()
-                                server.login(sender_email, sender_password)
-                                text = msg.as_string()
-                                server.sendmail(sender_email, email, text)
-                                server.quit()
-                                st.success(f"Email sent to {email} for {run_num}")
-                                sent_count += 1
-                            except Exception as e:
-                                st.error(f"Failed to send email to {email} for {run_num}: {e}")
-                                failed_count += 1
-                        else:
-                            st.warning(f"No email configured for {run_num}")
+                    date_str = datetime.now().strftime('%Y/%m/%d')
                     
-                    st.info(f"Processed {len(split_pdfs)} runs, sent {sent_count} emails, {failed_count} failed.")
+                    for email, run_list in email_to_runs.items():
+                        # Merge PDFs
+                        merged_writer = PyPDF2.PdfWriter()
+                        run_names = []
+                        for run_num, run_pdf in run_list:
+                            with open(run_pdf, 'rb') as f:
+                                run_reader = PyPDF2.PdfReader(f)
+                                merged_writer.append_pages_from_reader(run_reader)
+                            run_names.append(run_num)
+                        
+                        merged_path = os.path.join(OUTPUT_DIR, f'combined_{email.replace("@", "_")}.pdf')
+                        with open(merged_path, 'wb') as output_file:
+                            merged_writer.write(output_file)
+                        
+                        # Prepare email
+                        subject = f"Your Combined Run Sheets ({', '.join(run_names)}) - {date_str}"
+                        body = f"Dear Driver,\n\nPlease find attached your combined run sheets for {', '.join(run_names)}.\n\nBest regards,\nAdmin"
+                        
+                        msg = MIMEMultipart()
+                        msg['From'] = sender_email
+                        msg['To'] = email
+                        msg['Subject'] = subject
+                        
+                        msg.attach(MIMEText(body, 'plain'))
+                        
+                        with open(merged_path, 'rb') as attachment:
+                            part = MIMEBase('application', 'octet-stream')
+                            part.set_payload(attachment.read())
+                        
+                        encoders.encode_base64(part)
+                        part.add_header(
+                            'Content-Disposition',
+                            f'attachment; filename= {"Combined_Run_Sheets_" + date_str.replace("/", "_") + ".pdf"}'
+                        )
+                        msg.attach(part)
+                        
+                        try:
+                            server = smtplib.SMTP(email_server, email_port)
+                            server.starttls()
+                            server.login(sender_email, sender_password)
+                            text = msg.as_string()
+                            server.sendmail(sender_email, email, text)
+                            server.quit()
+                            st.success(f"Combined email sent to {email} ({len(run_list)} runs)")
+                            sent_count += 1
+                        except Exception as e:
+                            st.error(f"Failed to send email to {email} ({len(run_list)} runs): {e}")
+                            failed_count += 1
+                        
+                        # Clean up merged file
+                        os.remove(merged_path)
+                    
+                    # Handle runs without email
+                    unassigned_runs = [r for r in split_pdfs if r not in RUN_TO_EMAIL]
+                    if unassigned_runs:
+                        st.warning(f"No email configured for runs: {unassigned_runs}")
+                    
+                    st.info(f"Processed {len(split_pdfs)} runs across {len(email_to_runs)} drivers, sent {sent_count} emails, {failed_count} failed.")
                 else:
                     st.warning("Please configure sender email and password to send emails.")
                 
-                # Option to download splits
-                with st.expander("Download Split Files"):
+                # Option to download individual splits or combined (but since combined are temp, show individuals)
+                with st.expander("Download Individual Split Files"):
                     for run_num, pdf_path in split_pdfs.items():
                         with open(pdf_path, "rb") as f:
-                            btn = st.download_button(
+                            st.download_button(
                                 label=f"Download {run_num}_run.pdf",
                                 data=f.read(),
                                 file_name=f"{run_num}_run.pdf",
@@ -181,6 +210,7 @@ if uploaded_pdf is not None and len(RUN_TO_EMAIL) > 0:
         # Cleanup
         if os.path.exists(PDF_PATH):
             os.remove(PDF_PATH)
-            for file in os.listdir('split_runs'):
-                os.remove(os.path.join('split_runs', file))
-            os.rmdir('split_runs')
+            if os.path.exists(OUTPUT_DIR):
+                for file in os.listdir(OUTPUT_DIR):
+                    os.remove(os.path.join(OUTPUT_DIR, file))
+                os.rmdir(OUTPUT_DIR)
