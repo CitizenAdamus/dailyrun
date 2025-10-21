@@ -150,7 +150,7 @@ if uploaded_pdf is not None and len(RUN_TO_EMAIL) > 0:
                             merged_writer.write(output_file)
                         
                         # Prepare email
-                        subject = f"Your Combined Run Sheets ({', '.join(run_names)}) - {date_str}"
+                        subject = f"WT Operator Schedule for ({', '.join(run_names)}) - {date_str}"
                         body = f"Dear Driver,\n\nPlease find attached your combined run sheets for {', '.join(run_names)}.\n\nBest regards,\nAdmin"
                         
                         msg = MIMEMultipart()
@@ -214,3 +214,4 @@ if uploaded_pdf is not None and len(RUN_TO_EMAIL) > 0:
                 for file in os.listdir(OUTPUT_DIR):
                     os.remove(os.path.join(OUTPUT_DIR, file))
                 os.rmdir(OUTPUT_DIR)
+
